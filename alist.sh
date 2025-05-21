@@ -1,142 +1,113 @@
-#!/bin/bash
+#!/bin/sh
 ###############################################################################
-#
-# Alist Manager Script (Alpine Linux 适配版)
-#
-# 修改说明：
-# 1. 移除 systemd 依赖，适配 OpenRC
-# 2. 默认使用 musl-libc 版本
-# 3. 优化 Alpine 下的路径检测
-#
-# 适用系统：Alpine Linux 3.21.2+ (x86_64)
-#
+# Alist Manager Script - Alpine Compatible
+# Based on v3.sh, modified for Alpine Linux 3.21.2 x86_64
+# Author: Troray + ChatGPT Alpine Patch
 ###############################################################################
 
-# 错误处理函数
-handle_error() {
-    local exit_code=$1
-    local error_msg=$2
-    echo -e "${RED_COLOR}错误：${error_msg}${RES}"
-    exit ${exit_code}
+# ANSI color config
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RESET='\033[0m'
+
+# Check if running on Alpine
+is_alpine() {
+  [ -f /etc/alpine-release ]
 }
 
-# 检测必要命令
-for cmd in curl tar wget; do
-    if ! command -v $cmd >/dev/null 2>&1; then
-        echo -e "${YELLOW_COLOR}警告：未找到 $cmd，正在尝试安装...${RES}"
-        apk add --no-cache $cmd || handle_error 1 "安装 $cmd 失败"
-    fi
+# Detect architecture
+ARCH="UNKNOWN"
+platform=$(uname -m)
+[ "$platform" = "x86_64" ] && ARCH=amd64
+[ "$platform" = "aarch64" ] && ARCH=arm64
+
+if [ "$ARCH" = "UNKNOWN" ]; then
+  echo "${RED}不支持的架构: $platform${RESET}"
+  exit 1
+fi
+
+# Check essential tools
+REQUIRED_CMDS="curl tar"
+if is_alpine; then
+  REQUIRED_CMDS="$REQUIRED_CMDS ip"
+fi
+for cmd in $REQUIRED_CMDS; do
+  if ! command -v $cmd >/dev/null 2>&1; then
+    echo "${YELLOW}警告: 未找到 $cmd，请运行 'apk add $cmd' 安装${RESET}"
+  fi
 done
 
-# 配置部分
-GH_DOWNLOAD_URL="https://github.com/alist-org/alist/releases/latest/download"
-ALIST_BIN_NAME="alist-linux-musl-amd64.tar.gz"  # 强制使用 musl 版本
+# Set default install path
+INSTALL_PATH="/opt/alist"
 
-# 颜色配置
-RED_COLOR='\e[1;31m'
-GREEN_COLOR='\e[1;32m'
-YELLOW_COLOR='\e[1;33m'
-RES='\e[0m'
+# Proxy setting
+GH_PROXY=""
+read -p "请输入 GitHub 代理地址（可选，例如 https://ghproxy.com/ ）: " GH_PROXY
+GH_DOWNLOAD_URL="${GH_PROXY}https://github.com/alist-org/alist/releases/latest/download"
 
-# 获取已安装路径（适配 Alpine）
-GET_INSTALLED_PATH() {
-    # 检测是否通过 OpenRC 安装
-    if [ -f "/etc/init.d/alist" ]; then
-        installed_path=$(grep "command=" /etc/init.d/alist | cut -d'"' -f2 | xargs dirname)
-        if [ -f "$installed_path/alist" ]; then
-            echo "$installed_path"
-            return 0
-        fi
-    fi
-    
-    # 默认路径
-    echo "/opt/alist"
+# Download alist binary
+echo "${GREEN}下载 Alist...${RESET}"
+curl -L "${GH_DOWNLOAD_URL}/alist-linux-musl-${ARCH}.tar.gz" -o /tmp/alist.tar.gz || {
+  echo "${RED}下载失败${RESET}"; exit 1;
 }
 
-# 设置安装路径
-INSTALL_PATH=$(GET_INSTALLED_PATH)  # 默认使用已安装路径或 /opt/alist
-
-# 安装函数
-INSTALL() {
-    echo -e "${GREEN_COLOR}下载 Alist (musl 版本)...${RES}"
-    if ! wget -O /tmp/alist.tar.gz "$GH_DOWNLOAD_URL/$ALIST_BIN_NAME"; then
-        handle_error 1 "下载失败！请检查网络或代理"
-    fi
-
-    echo -e "${GREEN_COLOR}解压文件...${RES}"
-    mkdir -p "$INSTALL_PATH"
-    tar zxf /tmp/alist.tar.gz -C "$INSTALL_PATH" || handle_error 1 "解压失败"
-    chmod +x "$INSTALL_PATH/alist"
-
-    # 获取管理员账号
-    cd "$INSTALL_PATH"
-    ADMIN_INFO=$("./alist" admin random 2>&1)
-    ADMIN_USER=$(echo "$ADMIN_INFO" | grep -oP "username:\s*\K\S+")
-    ADMIN_PASS=$(echo "$ADMIN_INFO" | grep -oP "password:\s*\K\S+")
-    cd - >/dev/null
-
-    echo -e "${GREEN_COLOR}安装完成！${RES}"
+mkdir -p "$INSTALL_PATH"
+tar -zxf /tmp/alist.tar.gz -C "$INSTALL_PATH" || {
+  echo "${RED}解压失败${RESET}"; exit 1;
 }
+chmod +x "$INSTALL_PATH/alist"
 
-# 创建 OpenRC 服务
-CREATE_OPENRC_SERVICE() {
-    cat > /etc/init.d/alist <<EOF
+# Setup service
+if is_alpine; then
+  echo "${GREEN}创建 OpenRC 服务...${RESET}"
+  cat <<EOF > /etc/init.d/alist
 #!/sbin/openrc-run
-name="Alist"
-description="Alist file storage"
-command="$INSTALL_PATH/alist"
-command_args="server"
+command=\"$INSTALL_PATH/alist\"
+command_args=\"server\"
 command_background=true
-pidfile="/var/run/alist.pid"
-
-depend() {
-    need net
-}
+directory=\"$INSTALL_PATH\"
+pidfile=/var/run/alist.pid
 EOF
+  chmod +x /etc/init.d/alist
+  rc-update add alist default
+else
+  echo "${GREEN}创建 systemd 服务...${RESET}"
+  cat <<EOF > /etc/systemd/system/alist.service
+[Unit]
+Description=Alist
+After=network.target
 
-    chmod +x /etc/init.d/alist
-    rc-update add alist default
-    rc-service alist start
-}
+[Service]
+Type=simple
+ExecStart=$INSTALL_PATH/alist server
+WorkingDirectory=$INSTALL_PATH
+Restart=on-failure
 
-# 卸载函数
-UNINSTALL() {
-    rc-service alist stop
-    rc-update del alist
-    rm -f /etc/init.d/alist
-    rm -rf "$INSTALL_PATH"
-    echo -e "${GREEN_COLOR}卸载完成！${RES}"
-}
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable alist
+fi
 
-# 主菜单
-MENU() {
-    clear
-    echo -e "\n${GREEN_COLOR}Alist 管理脚本 (Alpine 适配版)${RES}"
-    echo -e "----------------------------------------"
-    echo -e "1. 安装 Alist"
-    echo -e "2. 创建 OpenRC 服务"
-    echo -e "3. 卸载 Alist"
-    echo -e "4. 启动 Alist"
-    echo -e "5. 停止 Alist"
-    echo -e "6. 重置管理员密码"
-    echo -e "0. 退出"
-    echo -e "----------------------------------------"
-    read -p "请输入选项 [0-6]: " choice
+# Start service
+if is_alpine; then
+  rc-service alist start
+else
+  systemctl start alist
+fi
 
-    case "$choice" in
-        1) INSTALL ;;
-        2) CREATE_OPENRC_SERVICE ;;
-        3) UNINSTALL ;;
-        4) rc-service alist start ;;
-        5) rc-service alist stop ;;
-        6) "$INSTALL_PATH/alist" admin random ;;
-        0) exit 0 ;;
-        *) echo -e "${RED_COLOR}无效选项！${RES}" ;;
-    esac
-}
+# Get credentials
+echo "${GREEN}初始化账号...${RESET}"
+ACCOUNT_OUTPUT=$("$INSTALL_PATH/alist" admin random 2>&1)
+echo "$ACCOUNT_OUTPUT"
 
-# 执行主菜单
-while true; do
-    MENU
-    read -p "按回车键继续..."
-done
+# Show IP info
+LOCAL_IP=$(ip addr show | grep -w inet | grep -v "127.0.0.1" | awk '{print $2}' | cut -d/ -f1 | head -n1)
+PUBLIC_IP=$(curl -s4 ip.sb || echo "获取失败")
+
+echo "\n访问地址："
+echo "局域网：http://${LOCAL_IP}:5244/"
+echo "公网：  http://${PUBLIC_IP}:5244/"
+echo "安装完成。"
